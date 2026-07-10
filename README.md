@@ -21,6 +21,7 @@ If you like this crate show some support by [following fcoury (me) on X](https:/
 - **Smart completion** - Schema-aware autocomplete for tables, columns, and keywords
 - **Results grid** - Scrollable, searchable data grid with column resizing, multi-row selection, and flexible yank (TSV/CSV/JSON/Markdown)
 - **Inline editing** - Edit cells directly in the grid with automatic SQL generation
+- **Write safeguards** - Confirm destructive statements and generated cell-update SQL; mark saved connections read-only
 - **JSON support** - Detect, format, and edit JSON/JSONB columns with syntax highlighting
 - **Postgres + MongoDB** - Connect with `postgres://...` or `mongodb://...` URLs
 - **Schema commands** - `psql`-style commands plus Mongo helpers (`:show dbs`, `:show collections`, `:describe`)
@@ -266,6 +267,23 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 See [config.example.toml](config.example.toml) for all available options.
+
+Saved connections live in `~/.tsql/connections.toml`. To prevent writes on
+specific saved connections, add their names to the top-level list:
+
+```toml
+read_only_connections = ["production", "analytics-replica"]
+
+[[connection]]
+name = "production"
+# ...remaining connection fields...
+```
+
+Read-only connections are labeled in the status line and locally reject
+recognized SQL writes. The active connection's configured color is also used
+in the status line. `UPDATE` or `DELETE` without a top-level `WHERE`, plus
+`DROP` and `TRUNCATE`, require confirmation on writable connections. Inline
+cell edits show the generated SQL before execution.
 
 ### 1Password integration
 

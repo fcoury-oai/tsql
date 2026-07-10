@@ -56,6 +56,15 @@ pub enum ConfirmContext {
     ReplaceQuery { query: String },
     /// Replacing the current query with a generated schema query and executing it.
     ReplaceAndExecuteQuery { query: String },
+    /// Executing a query that was classified as destructive.
+    ExecuteDestructiveQuery { query: String, refresh: bool },
+    /// Executing the generated SQL for an inline cell edit.
+    ExecuteCellUpdate {
+        sql: String,
+        row: usize,
+        col: usize,
+        new_value: String,
+    },
 }
 
 /// A reusable confirmation dialog for unsaved changes.
@@ -128,6 +137,8 @@ impl ConfirmPrompt {
             ConfirmContext::ReplaceQuery { .. } | ConfirmContext::ReplaceAndExecuteQuery { .. } => {
                 " Replace Query "
             }
+            ConfirmContext::ExecuteDestructiveQuery { .. }
+            | ConfirmContext::ExecuteCellUpdate { .. } => " Confirm Database Write ",
             ConfirmContext::QuitAppClean => " Confirm Quit ",
             ConfirmContext::DeleteConnection { .. } => " Delete Connection ",
             ConfirmContext::ApplyUpdate { .. } => " Apply Update ",

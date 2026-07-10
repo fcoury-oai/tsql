@@ -115,12 +115,9 @@ impl ConnectionInfo {
             self.database = Some(database.to_string());
         }
 
-        let (auth, host_port) = if auth_host.contains('@') {
-            let (a, h) = auth_host.rsplit_once('@').unwrap();
-            (Some(a), h)
-        } else {
-            (None, auth_host)
-        };
+        let (auth, host_port) = auth_host
+            .rsplit_once('@')
+            .map_or((None, auth_host), |(auth, host)| (Some(auth), host));
 
         // Parse user from auth (user:pass)
         if let Some(auth) = auth {

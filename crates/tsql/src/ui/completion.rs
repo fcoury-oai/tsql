@@ -248,14 +248,14 @@ impl SchemaCache {
                     })
                     .collect();
 
-                let table_item = TreeItem::new(table_id, table.name.clone(), column_items)
-                    .expect("valid table tree item");
-                table_items.push(table_item);
+                if let Ok(table_item) = TreeItem::new(table_id, table.name.clone(), column_items) {
+                    table_items.push(table_item);
+                }
             }
 
-            let schema_item =
-                TreeItem::new(schema_id, schema_name, table_items).expect("valid schema tree item");
-            tree_items.push(schema_item);
+            if let Ok(schema_item) = TreeItem::new(schema_id, schema_name, table_items) {
+                tree_items.push(schema_item);
+            }
         }
 
         tree_items
@@ -497,10 +497,8 @@ pub fn determine_context(text: &str, cursor_col: usize) -> CompletionContext {
         let second_last = tokens[tokens.len() - 2];
         match second_last {
             "ORDER" | "GROUP" => return CompletionContext::General,
-            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" => {
-                if tokens.last() == Some(&"JOIN") {
-                    return CompletionContext::AfterFrom;
-                }
+            "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" if tokens.last() == Some(&"JOIN") => {
+                return CompletionContext::AfterFrom;
             }
             _ => {}
         }

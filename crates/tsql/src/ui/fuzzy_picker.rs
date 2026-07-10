@@ -629,7 +629,7 @@ impl<T: Clone> FuzzyPicker<T> {
                 .collect();
 
             // Sort by score descending.
-            matches.sort_by(|a, b| b.score.cmp(&a.score));
+            matches.sort_by_key(|item| std::cmp::Reverse(item.score));
             self.filtered = matches;
         }
 

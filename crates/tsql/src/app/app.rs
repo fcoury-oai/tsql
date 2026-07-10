@@ -44,16 +44,16 @@ use crate::config::{
 use crate::history::{History, HistoryEntry};
 use crate::session::SessionState;
 use crate::ui::{
-    create_sql_highlighter, determine_context, escape_sql_value, get_word_before_cursor, is_inside,
-    quote_identifier, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt, CompletionKind,
-    CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult, ConnectionFormAction,
-    ConnectionFormModal, ConnectionInfo, ConnectionManagerAction, ConnectionManagerModal,
-    CursorShape, DataGrid, FuzzyPicker, GridKeyResult, GridModel, GridState, HelpAction, HelpPopup,
-    HighlightedTextArea, JsonEditorAction, JsonEditorModal, KeyHintPopup, KeySequenceAction,
-    KeySequenceCompletion, KeySequenceHandlerWithContext, KeySequenceResult, PasswordPrompt,
-    PasswordPromptResult, PendingKey, PickerAction, Priority, QueryEditor, ResizeAction,
-    RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar, SidebarAction,
-    StatusLineBuilder, StatusSegment, TableInfo, YankFormat,
+    create_sql_highlighter, determine_context, escape_sql_value_for_type, get_word_before_cursor,
+    is_inside, quote_identifier, AiQueryModal, AiQueryModalAction, ColumnInfo, CommandPrompt,
+    CompletionKind, CompletionPopup, ConfirmContext, ConfirmPrompt, ConfirmResult,
+    ConnectionFormAction, ConnectionFormModal, ConnectionInfo, ConnectionManagerAction,
+    ConnectionManagerModal, CursorShape, DataGrid, FuzzyPicker, GridCell, GridKeyResult, GridModel,
+    GridState, HelpAction, HelpPopup, HighlightedTextArea, JsonEditorAction, JsonEditorModal,
+    KeyHintPopup, KeySequenceAction, KeySequenceCompletion, KeySequenceHandlerWithContext,
+    KeySequenceResult, PasswordPrompt, PasswordPromptResult, PendingKey, PickerAction, Priority,
+    QueryEditor, ResizeAction, RowDetailAction, RowDetailModal, SchemaCache, SearchPrompt, Sidebar,
+    SidebarAction, StatusLineBuilder, StatusSegment, TableInfo, YankFormat,
 };
 use crate::update::{
     apply_update, check_for_update, current_target_triple, detect_current_install_method,
@@ -573,9 +573,9 @@ LEFT JOIN (
         ON tc.constraint_name = ku.constraint_name
         AND tc.table_schema = ku.table_schema
     WHERE tc.constraint_type = 'PRIMARY KEY'
-      AND tc.table_name = '$1'
+      AND tc.table_name = $1
 ) pk ON c.column_name = pk.column_name
-WHERE c.table_name = '$1'
+WHERE c.table_name = $1
 ORDER BY c.ordinal_position
 "#;
 
@@ -647,42 +647,19 @@ JOIN information_schema.key_column_usage ku
     ON tc.constraint_name = ku.constraint_name
     AND tc.table_schema = ku.table_schema
 WHERE tc.constraint_type = 'PRIMARY KEY'
-  AND tc.table_name = '$1'
+  AND tc.table_name = $1
 ORDER BY ku.ordinal_position
 "#;
 
-/// Escape a SQL identifier for use in queries (prevents SQL injection)
-fn escape_sql_identifier(s: &str) -> String {
-    // Remove any existing quotes and escape internal quotes
-    let cleaned = s.trim_matches('"').replace('"', "\"\"");
-    // For simple identifiers, return as-is; otherwise quote
-    if cleaned
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        cleaned
-    } else {
-        format!("\"{}\"", cleaned)
-    }
-}
-
 /// Fetch primary key column names for a table.
 async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
-    let query = META_QUERY_PRIMARY_KEYS.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
 
-    match guard.simple_query(&query).await {
-        Ok(messages) => {
-            let mut pks = Vec::new();
-            for msg in messages {
-                if let SimpleQueryMessage::Row(row) = msg {
-                    if let Some(col_name) = row.get(0) {
-                        pks.push(col_name.to_string());
-                    }
-                }
-            }
-            pks
-        }
+    match guard.query(META_QUERY_PRIMARY_KEYS, &[&table]).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<_, String>(0).ok())
+            .collect(),
         Err(_) => Vec::new(), // Silently fail - PK detection is optional
     }
 }
@@ -691,7 +668,7 @@ async fn fetch_primary_keys(client: &SharedClient, table: &str) -> Vec<String> {
 const META_QUERY_COLUMN_TYPES: &str = r#"
 SELECT column_name, data_type
 FROM information_schema.columns
-WHERE table_name = '$1'
+WHERE table_name = $1
 ORDER BY ordinal_position
 "#;
 
@@ -700,17 +677,16 @@ async fn fetch_column_types(
     client: &SharedClient,
     table: &str,
 ) -> std::collections::HashMap<String, String> {
-    let query = META_QUERY_COLUMN_TYPES.replace("$1", &escape_sql_identifier(table));
     let guard = client.lock().await;
 
-    match guard.simple_query(&query).await {
-        Ok(messages) => {
+    match guard.query(META_QUERY_COLUMN_TYPES, &[&table]).await {
+        Ok(rows) => {
             let mut types = std::collections::HashMap::new();
-            for msg in messages {
-                if let SimpleQueryMessage::Row(row) = msg {
-                    if let (Some(col_name), Some(data_type)) = (row.get(0), row.get(1)) {
-                        types.insert(col_name.to_string(), data_type.to_string());
-                    }
+            for row in rows {
+                if let (Ok(col_name), Ok(data_type)) =
+                    (row.try_get::<_, String>(0), row.try_get::<_, String>(1))
+                {
+                    types.insert(col_name, data_type);
                 }
             }
             types
@@ -721,7 +697,7 @@ async fn fetch_column_types(
 
 pub struct QueryResult {
     pub headers: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<GridCell>>,
     pub command_tag: Option<String>,
     pub truncated: bool,
     pub elapsed: Duration,
@@ -731,6 +707,14 @@ pub struct QueryResult {
     pub primary_keys: Vec<String>,
     /// Column data types from PostgreSQL (e.g., "jsonb", "text", "int4").
     pub col_types: Vec<String>,
+}
+
+fn text_grid_row(values: impl IntoIterator<Item = String>) -> Vec<GridCell> {
+    values.into_iter().map(GridCell::Text).collect()
+}
+
+fn simple_query_grid_cell(value: Option<&str>) -> GridCell {
+    value.map_or(GridCell::Null, |value| GridCell::Text(value.to_string()))
 }
 
 /// State for a paged/streaming query using server-side cursors.
@@ -803,21 +787,23 @@ const QUERY_EXPANDED_MAX_RATIO_DENOM: u16 = 2; // 50%
 
 /// Check if a query is suitable for cursor-based paging.
 ///
-/// Returns true for simple SELECT queries without:
-/// - JOINs
-/// - Subqueries in FROM clause
-/// - Multiple statements
-///
-/// This allows us to use server-side cursors for efficient streaming.
+/// PostgreSQL cursors accept single SELECT-like statements, including joins,
+/// CTEs, subqueries, VALUES, and TABLE. Routing all of those through the cursor
+/// path ensures the server-side row cap is applied before results reach the
+/// client.
 fn is_pageable_query(query: &str) -> bool {
-    // Reuse the logic from extract_table_from_query - if it can extract a table,
-    // the query is simple enough to page.
-    // Also check for multiple statements (semicolons not at the end).
-    let trimmed = query.trim().trim_end_matches(';');
-    if trimmed.contains(';') {
-        return false; // Multiple statements
+    let statements = sql_words_with_depth(query);
+    if statements.len() != 1 {
+        return false;
     }
-    extract_table_from_query(query).is_some()
+
+    let first = statements[0]
+        .iter()
+        .find(|(_, depth)| *depth == 0)
+        .map(|(word, _)| word.as_str())
+        .unwrap_or_default();
+
+    matches!(first, "SELECT" | "WITH" | "VALUES" | "TABLE")
 }
 
 fn is_row_returning_query(query: &str) -> bool {
@@ -834,6 +820,238 @@ fn is_row_returning_query(query: &str) -> bool {
         || first.eq_ignore_ascii_case("table")
         || first.eq_ignore_ascii_case("show")
         || first.eq_ignore_ascii_case("explain")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlSafety {
+    ReadOnly,
+    Write,
+    Destructive,
+}
+
+/// Classify SQL while ignoring quoted text and comments. Parenthesis depth is
+/// retained so write CTEs and their own WHERE clauses are handled correctly.
+/// The result is intentionally conservative and shared by the read-only
+/// connection and destructive-query safeguards.
+fn classify_sql_safety(query: &str) -> SqlSafety {
+    let mut saw_write = false;
+
+    for words in sql_words_with_depth(query) {
+        for (index, (keyword, keyword_depth)) in words.iter().enumerate() {
+            let is_write = matches!(
+                keyword.as_str(),
+                "INSERT"
+                    | "UPDATE"
+                    | "DELETE"
+                    | "MERGE"
+                    | "COPY"
+                    | "CREATE"
+                    | "ALTER"
+                    | "DROP"
+                    | "TRUNCATE"
+                    | "GRANT"
+                    | "REVOKE"
+                    | "COMMENT"
+                    | "VACUUM"
+                    | "ANALYZE"
+                    | "REINDEX"
+                    | "CLUSTER"
+                    | "REFRESH"
+            );
+            if !is_write {
+                continue;
+            }
+
+            saw_write = true;
+            if matches!(keyword.as_str(), "DROP" | "TRUNCATE") {
+                return SqlSafety::Destructive;
+            }
+            if matches!(keyword.as_str(), "UPDATE" | "DELETE")
+                && !words[index + 1..]
+                    .iter()
+                    .any(|(word, depth)| word == "WHERE" && depth == keyword_depth)
+            {
+                return SqlSafety::Destructive;
+            }
+        }
+    }
+
+    if saw_write {
+        SqlSafety::Write
+    } else {
+        SqlSafety::ReadOnly
+    }
+}
+
+fn contains_unsafe_row_returning_batch(query: &str) -> bool {
+    let statements = sql_words_with_depth(query);
+    statements.len() > 1
+        && statements.iter().any(|words| {
+            let row_returning_head =
+                words
+                    .iter()
+                    .find(|(_, depth)| *depth == 0)
+                    .is_some_and(|(word, _)| {
+                        matches!(word.as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE")
+                    });
+            row_returning_head || words.iter().any(|(word, _)| word == "RETURNING")
+        })
+}
+
+fn wrap_dml_returning_query(query: &str, max_rows: usize) -> Option<String> {
+    let statements = sql_words_with_depth(query);
+    let words = (statements.len() == 1).then(|| statements.first())??;
+    let (write_index, (_, write_depth)) = words
+        .iter()
+        .enumerate()
+        .find(|(_, (word, _))| matches!(word.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"))?;
+    let has_returning = words[write_index + 1..]
+        .iter()
+        .any(|(word, depth)| word == "RETURNING" && depth == write_depth);
+    if !has_returning {
+        return None;
+    }
+
+    let query = query.trim().trim_end_matches(';');
+    let fetch_limit = max_rows.saturating_add(1);
+    Some(format!(
+        "WITH tsql_affected_rows AS ({query}) SELECT * FROM tsql_affected_rows LIMIT {fetch_limit}"
+    ))
+}
+
+fn sql_words_with_depth(query: &str) -> Vec<Vec<(String, usize)>> {
+    let mut statements = vec![Vec::new()];
+    let mut word = String::new();
+    let mut chars = query.chars().peekable();
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut dollar_quote: Option<String> = None;
+
+    fn flush_word(word: &mut String, statements: &mut [Vec<(String, usize)>], depth: usize) {
+        if !word.is_empty() {
+            if let Some(statement) = statements.last_mut() {
+                statement.push((std::mem::take(word).to_ascii_uppercase(), depth));
+            }
+        }
+    }
+
+    fn take_dollar_delimiter(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> Option<String> {
+        let mut probe = chars.clone();
+        let mut delimiter = "$".to_string();
+        while let Some(ch) = probe.next() {
+            if ch == '$' {
+                delimiter.push('$');
+                *chars = probe;
+                return Some(delimiter);
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                delimiter.push(ch);
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    while let Some(ch) = chars.next() {
+        if let Some(active_delimiter) = dollar_quote.as_deref() {
+            if ch == '$' {
+                if let Some(delimiter) = take_dollar_delimiter(&mut chars) {
+                    if delimiter == active_delimiter {
+                        dollar_quote = None;
+                    }
+                }
+            }
+            continue;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if block_comment_depth > 0 {
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                block_comment_depth += 1;
+            } else if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment_depth -= 1;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '-' if chars.peek() == Some(&'-') => {
+                flush_word(&mut word, &mut statements, depth);
+                chars.next();
+                in_line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                flush_word(&mut word, &mut statements, depth);
+                chars.next();
+                block_comment_depth = 1;
+            }
+            '\'' => {
+                flush_word(&mut word, &mut statements, depth);
+                in_single = true;
+            }
+            '"' => {
+                flush_word(&mut word, &mut statements, depth);
+                in_double = true;
+            }
+            '$' => {
+                flush_word(&mut word, &mut statements, depth);
+                dollar_quote = take_dollar_delimiter(&mut chars);
+            }
+            '(' => {
+                flush_word(&mut word, &mut statements, depth);
+                depth += 1;
+            }
+            ')' => {
+                flush_word(&mut word, &mut statements, depth);
+                depth = depth.saturating_sub(1);
+            }
+            ';' if depth == 0 => {
+                flush_word(&mut word, &mut statements, depth);
+                if !statements.last().is_some_and(Vec::is_empty) {
+                    statements.push(Vec::new());
+                }
+            }
+            ch if ch.is_ascii_alphanumeric() || ch == '_' => word.push(ch),
+            _ => flush_word(&mut word, &mut statements, depth),
+        }
+    }
+    flush_word(&mut word, &mut statements, depth);
+    statements.retain(|statement| !statement.is_empty());
+    statements
 }
 
 fn compute_query_panel_height(main_height: u16, mode: Mode, editor_line_count: usize) -> u16 {
@@ -1264,6 +1482,36 @@ enum MongoQuery {
         collection: String,
         filter: Document,
     },
+}
+
+fn classify_mongo_safety(query: &str) -> SqlSafety {
+    match parse_mongo_query(query) {
+        Ok(MongoQuery::Find { .. })
+        | Ok(MongoQuery::FindOne { .. })
+        | Ok(MongoQuery::CountDocuments { .. }) => SqlSafety::ReadOnly,
+        Ok(MongoQuery::Aggregate { pipeline, .. }) => {
+            if pipeline
+                .iter()
+                .any(|stage| stage.contains_key("$out") || stage.contains_key("$merge"))
+            {
+                SqlSafety::Destructive
+            } else {
+                SqlSafety::ReadOnly
+            }
+        }
+        Ok(MongoQuery::UpdateMany { filter, .. }) | Ok(MongoQuery::DeleteMany { filter, .. })
+            if filter.is_empty() =>
+        {
+            SqlSafety::Destructive
+        }
+        Ok(MongoQuery::InsertOne { .. })
+        | Ok(MongoQuery::InsertMany { .. })
+        | Ok(MongoQuery::UpdateOne { .. })
+        | Ok(MongoQuery::UpdateMany { .. })
+        | Ok(MongoQuery::DeleteOne { .. })
+        | Ok(MongoQuery::DeleteMany { .. }) => SqlSafety::Write,
+        Err(_) => SqlSafety::ReadOnly,
+    }
 }
 
 fn json_value_to_bson(value: &serde_json::Value) -> std::result::Result<Bson, String> {
@@ -2062,7 +2310,7 @@ fn mongo_result_from_documents(
     if docs.is_empty() {
         return QueryResult {
             headers: vec!["status".to_string()],
-            rows: vec![vec!["No documents".to_string()]],
+            rows: vec![text_grid_row(["No documents".to_string()])],
             command_tag: Some("0 rows".to_string()),
             truncated,
             elapsed,
@@ -2086,7 +2334,10 @@ fn mongo_result_from_documents(
     for doc in &docs {
         let mut row = Vec::with_capacity(headers.len());
         for header in &headers {
-            let value = doc.get(header).map(bson_to_grid_cell).unwrap_or_default();
+            let value = match doc.get(header) {
+                Some(Bson::Null) | None => GridCell::Null,
+                Some(value) => GridCell::Text(bson_to_grid_cell(value)),
+            };
             row.push(value);
         }
         rows.push(row);
@@ -2176,7 +2427,7 @@ pub enum DbEvent {
     /// Additional rows have been fetched (for streaming/paged results).
     RowsAppended {
         /// The new rows to append.
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<GridCell>>,
         /// Whether this is the final batch (no more rows available).
         done: bool,
         /// Whether fetching was truncated due to max_rows limit.
@@ -3702,11 +3953,7 @@ impl App {
                             break;
                         }
                     }
-                    Event::Mouse(mouse) => {
-                        if self.on_mouse(mouse) {
-                            break;
-                        }
-                    }
+                    Event::Mouse(mouse) if self.on_mouse(mouse) => break,
                     _ => {}
                 }
             }
@@ -5013,7 +5260,10 @@ impl App {
         }
 
         let headers = self.grid.headers.clone();
-        let values = self.grid.rows[row].clone();
+        let values = self.grid.rows[row]
+            .iter()
+            .map(|cell| cell.display_text().to_string())
+            .collect();
         let col_types = self.grid.col_types.clone();
 
         self.row_detail = Some(RowDetailModal::new(headers, values, col_types, row));
@@ -5129,6 +5379,32 @@ impl App {
                 self.replace_editor_and_execute_schema_query(query);
                 false
             }
+            ConfirmContext::ExecuteDestructiveQuery { query, refresh } => {
+                if self.active_connection_is_read_only() {
+                    self.last_error = Some(
+                        "Write blocked: the active saved connection is configured as read-only"
+                            .to_string(),
+                    );
+                    self.last_status = Some("Read-only connection".to_string());
+                    return false;
+                }
+                let kind = if refresh {
+                    QueryExecutionKind::Refresh
+                } else {
+                    QueryExecutionKind::New
+                };
+                self.execute_query_text_unchecked(query, kind);
+                false
+            }
+            ConfirmContext::ExecuteCellUpdate {
+                sql,
+                row,
+                col,
+                new_value,
+            } => {
+                self.execute_cell_update(sql, row, col, new_value);
+                false
+            }
         }
     }
 
@@ -5170,6 +5446,10 @@ impl App {
             }
             ConfirmContext::ReplaceAndExecuteQuery { .. } => {
                 self.last_status = Some("Query execution cancelled".to_string());
+            }
+            ConfirmContext::ExecuteDestructiveQuery { .. }
+            | ConfirmContext::ExecuteCellUpdate { .. } => {
+                self.last_status = Some("Database write cancelled".to_string());
             }
         }
     }
@@ -5324,11 +5604,11 @@ impl App {
             "UPDATE {} SET {} = {} WHERE {}",
             quote_identifier(&table),
             quote_identifier(&column_name),
-            escape_sql_value(&new_value),
+            escape_sql_value_for_type(&new_value, self.grid.col_types.get(col).map(String::as_str),),
             where_clause
         );
 
-        self.execute_cell_update(update_sql, row, col, new_value);
+        self.request_cell_update_confirmation(update_sql, row, col, new_value);
     }
 
     fn commit_cell_edit(&mut self) {
@@ -5383,13 +5663,13 @@ impl App {
             "UPDATE {} SET {} = {} WHERE {}",
             quote_identifier(&table),
             quote_identifier(&column_name),
-            escape_sql_value(&new_value),
+            escape_sql_value_for_type(&new_value, self.grid.col_types.get(col).map(String::as_str),),
             where_clause
         );
 
         // Close editor and execute update
         self.cell_editor.close();
-        self.execute_cell_update(update_sql, row, col, new_value);
+        self.request_cell_update_confirmation(update_sql, row, col, new_value);
     }
 
     fn commit_mongo_edit(
@@ -5399,6 +5679,15 @@ impl App {
         col: usize,
         edited_original_value: Option<&str>,
     ) {
+        if self.active_connection_is_read_only() {
+            self.last_error = Some(
+                "Document update blocked: the active saved connection is configured as read-only"
+                    .to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+
         let collection = match &self.grid.source_table {
             Some(t) => t.clone(),
             None => {
@@ -5457,14 +5746,20 @@ impl App {
                     .col_types
                     .get(id_idx)
                     .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
-                filter.insert("_id", parse_grid_cell_to_bson(id_value, id_type_hint, true));
+                filter.insert(
+                    "_id",
+                    parse_grid_cell_to_bson(id_value.raw_text(), id_type_hint, true),
+                );
                 return Ok(filter);
             }
         }
 
         let mut filter = Document::new();
         for (idx, header) in self.grid.headers.iter().enumerate() {
-            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
+            let mut value = row_values
+                .get(idx)
+                .map(|cell| cell.raw_text())
+                .unwrap_or("NULL");
             if idx == edited_col {
                 if let Some(original) = edited_original_value {
                     value = original;
@@ -5546,7 +5841,43 @@ impl App {
         });
     }
 
+    fn request_cell_update_confirmation(
+        &mut self,
+        sql: String,
+        row: usize,
+        col: usize,
+        new_value: String,
+    ) {
+        if self.active_connection_is_read_only() {
+            self.last_error = Some(
+                "Cell update blocked: the active saved connection is configured as read-only"
+                    .to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+
+        self.confirm_prompt = Some(ConfirmPrompt::new(
+            format!("Execute this cell update?\n\n{sql}"),
+            ConfirmContext::ExecuteCellUpdate {
+                sql,
+                row,
+                col,
+                new_value,
+            },
+        ));
+    }
+
     fn execute_cell_update(&mut self, sql: String, row: usize, col: usize, new_value: String) {
+        if self.active_connection_is_read_only() {
+            self.last_error = Some(
+                "Cell update blocked: the active saved connection is configured as read-only"
+                    .to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+
         let Some(client) = self.db.client.clone() else {
             self.last_error = Some("Not connected".to_string());
             return;
@@ -5629,7 +5960,14 @@ impl App {
                 Some(format!(
                     "{} = {}",
                     quote_identifier(pk_name),
-                    escape_sql_value(pk_value)
+                    if pk_value.is_null() {
+                        "NULL".to_string()
+                    } else {
+                        escape_sql_value_for_type(
+                            pk_value.raw_text(),
+                            self.grid.col_types.get(pk_col_idx).map(String::as_str),
+                        )
+                    }
                 ))
             })
             .collect();
@@ -5656,16 +5994,22 @@ impl App {
 
         let mut match_conditions = Vec::new();
         for (idx, header) in self.grid.headers.iter().enumerate() {
-            let mut value = row_values.get(idx).map(|s| s.as_str()).unwrap_or("NULL");
-            if idx == edited_col {
-                if let Some(original) = edited_original_value {
-                    value = original;
+            let cell = row_values.get(idx);
+            let value = if cell.is_some_and(GridCell::is_null) {
+                "NULL".to_string()
+            } else {
+                let mut raw = cell.map(GridCell::raw_text).unwrap_or("NULL");
+                if idx == edited_col {
+                    if let Some(original) = edited_original_value {
+                        raw = original;
+                    }
                 }
-            }
+                escape_sql_value_for_type(raw, self.grid.col_types.get(idx).map(String::as_str))
+            };
             match_conditions.push(format!(
                 "{} IS NOT DISTINCT FROM {}",
                 quote_identifier(header),
-                escape_sql_literal_for_where(value)
+                value
             ));
         }
 
@@ -6097,6 +6441,17 @@ impl App {
         }
     }
 
+    fn active_saved_connection(&self) -> Option<&ConnectionEntry> {
+        let name = self.active_connection_name.as_deref()?;
+        self.connections.find_by_name(name)
+    }
+
+    fn active_connection_is_read_only(&self) -> bool {
+        self.active_connection_name
+            .as_deref()
+            .is_some_and(|name| self.connections.is_read_only(name))
+    }
+
     fn request_open_ai_modal(&mut self, prefill: Option<String>) {
         if !self.config.ai.enabled {
             self.last_error =
@@ -6518,12 +6873,8 @@ impl App {
             return;
         }
 
-        // Build the query, substituting table name if provided
-        let query = if let Some(table) = table_arg {
-            query_template.replace("$1", &escape_sql_identifier(table))
-        } else {
-            query_template.to_string()
-        };
+        let query = query_template.to_string();
+        let table_arg = table_arg.map(str::to_string);
 
         self.db.running = true;
         self.last_status = Some("Running...".to_string());
@@ -6534,13 +6885,62 @@ impl App {
 
         self.rt.spawn(async move {
             let guard = client.lock().await;
+            if let Some(table) = table_arg {
+                match guard.query(&query, &[&table]).await {
+                    Ok(db_rows) => {
+                        drop(guard);
+                        let elapsed = started.elapsed();
+                        let headers = db_rows
+                            .first()
+                            .map(|row| {
+                                row.columns()
+                                    .iter()
+                                    .map(|column| column.name().to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let rows = db_rows
+                            .into_iter()
+                            .map(|row| {
+                                (0..row.len())
+                                    .map(|index| {
+                                        row.try_get::<_, Option<String>>(index)
+                                            .ok()
+                                            .flatten()
+                                            .map_or(GridCell::Null, GridCell::Text)
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        let _ = tx.send(DbEvent::QueryFinished {
+                            result: QueryResult {
+                                headers,
+                                rows,
+                                command_tag: None,
+                                truncated: false,
+                                elapsed,
+                                source_table: None,
+                                primary_keys: Vec::new(),
+                                col_types: Vec::new(),
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DbEvent::QueryError {
+                            error: format_pg_error(&e),
+                        });
+                    }
+                }
+                return;
+            }
+
             match guard.simple_query(&query).await {
                 Ok(messages) => {
                     drop(guard);
                     let elapsed = started.elapsed();
 
                     let mut headers: Vec<String> = Vec::new();
-                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut rows: Vec<Vec<GridCell>> = Vec::new();
 
                     for msg in messages {
                         match msg {
@@ -6554,7 +6954,7 @@ impl App {
                                 }
                                 let mut out_row = Vec::with_capacity(row.len());
                                 for i in 0..row.len() {
-                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                    out_row.push(simple_query_grid_cell(row.get(i)));
                                 }
                                 rows.push(out_row);
                             }
@@ -6604,7 +7004,10 @@ impl App {
         self.rt.spawn(async move {
             match client.list_database_names().await {
                 Ok(names) => {
-                    let rows = names.into_iter().map(|n| vec![n]).collect::<Vec<_>>();
+                    let rows = names
+                        .into_iter()
+                        .map(|name| vec![GridCell::Text(name)])
+                        .collect::<Vec<_>>();
                     let result = QueryResult {
                         headers: vec!["name".to_string()],
                         rows,
@@ -6651,7 +7054,10 @@ impl App {
             let db = client.database(&db_name);
             match db.list_collection_names().await {
                 Ok(names) => {
-                    let rows = names.into_iter().map(|n| vec![n]).collect::<Vec<_>>();
+                    let rows = names
+                        .into_iter()
+                        .map(|name| vec![GridCell::Text(name)])
+                        .collect::<Vec<_>>();
                     let result = QueryResult {
                         headers: vec!["collection".to_string()],
                         rows,
@@ -6703,7 +7109,7 @@ impl App {
                     let mut rows = Vec::new();
                     if let Some(doc) = sample {
                         for (field, value) in doc {
-                            rows.push(vec![field, bson_type_name(&value).to_string()]);
+                            rows.push(text_grid_row([field, bson_type_name(&value).to_string()]));
                         }
                     }
                     let result = QueryResult {
@@ -6914,7 +7320,7 @@ impl App {
                         .col_types
                         .get(i)
                         .and_then(|t| (!t.is_empty()).then_some(t.as_str()));
-                    let bson_value = parse_grid_cell_to_bson(&cell, type_hint, true);
+                    let bson_value = parse_grid_cell_to_bson(cell.raw_text(), type_hint, true);
                     let json_value = bson::from_bson::<serde_json::Value>(bson_value.clone())
                         .unwrap_or_else(|_| {
                             serde_json::Value::String(bson_to_grid_cell(&bson_value))
@@ -9467,6 +9873,49 @@ impl App {
     }
 
     fn execute_query_text(&mut self, query: String, kind: QueryExecutionKind) {
+        let safety = if self.db.kind == Some(DbKind::Mongo) {
+            classify_mongo_safety(&query)
+        } else {
+            if contains_unsafe_row_returning_batch(&query) {
+                self.last_error = Some(
+                    "Row-returning SQL batches are not buffered for safety; run each statement separately"
+                        .to_string(),
+                );
+                self.last_status = Some("Query batch rejected".to_string());
+                return;
+            }
+            classify_sql_safety(&query)
+        };
+
+        if self.active_connection_is_read_only() && safety != SqlSafety::ReadOnly {
+            self.last_error = Some(
+                "Write blocked: the active saved connection is configured as read-only".to_string(),
+            );
+            self.last_status = Some("Read-only connection".to_string());
+            return;
+        }
+
+        if safety == SqlSafety::Destructive {
+            let preview = query.trim();
+            let preview = if preview.chars().count() > 240 {
+                format!("{}…", preview.chars().take(240).collect::<String>())
+            } else {
+                preview.to_string()
+            };
+            self.confirm_prompt = Some(ConfirmPrompt::new(
+                format!("Execute this potentially destructive statement?\n\n{preview}"),
+                ConfirmContext::ExecuteDestructiveQuery {
+                    query,
+                    refresh: kind == QueryExecutionKind::Refresh,
+                },
+            ));
+            return;
+        }
+
+        self.execute_query_text_unchecked(query, kind);
+    }
+
+    fn execute_query_text_unchecked(&mut self, query: String, kind: QueryExecutionKind) {
         if query.trim().is_empty() {
             self.last_status = Some("No query to run".to_string());
             return;
@@ -9543,9 +9992,18 @@ impl App {
 
         let source_table = extract_table_from_query(&query);
         let page_size = DEFAULT_PAGE_SIZE;
+        let bounded_dml_query = wrap_dml_returning_query(&query, max_rows);
+        let execution_query = bounded_dml_query.clone().unwrap_or_else(|| query.clone());
 
-        // Use cursor-based paging for simple SELECT queries
-        if is_pageable_query(&query) {
+        if bounded_dml_query.is_some() {
+            // PostgreSQL forbids data-modifying CTEs inside DECLARE CURSOR. The
+            // wrapper applies a server-side max_rows + 1 bound instead, allowing
+            // the simple protocol to detect truncation without buffering the
+            // entire RETURNING result.
+            self.paged_query = None;
+            self.execute_query_simple(client, execution_query, max_rows, source_table, tx);
+        } else if is_pageable_query(&execution_query) {
+            // Use cursor-based paging for every supported single row-returning query.
             // Create channel for fetch-more requests
             let (fetch_more_tx, fetch_more_rx) = mpsc::unbounded_channel();
 
@@ -9556,7 +10014,7 @@ impl App {
 
             self.execute_query_paged(
                 client,
-                query,
+                execution_query,
                 max_rows,
                 page_size,
                 source_table,
@@ -9638,7 +10096,7 @@ impl App {
             let first_page_size = page_size.min(max_rows);
             let fetch_query = format!("FETCH FORWARD {} FROM tsql_cursor", first_page_size);
             let mut headers: Vec<String> = Vec::new();
-            let mut first_page_rows: Vec<Vec<String>> = Vec::new();
+            let mut first_page_rows: Vec<Vec<GridCell>> = Vec::new();
             let mut total_fetched: usize = 0;
             let mut done = false;
             let mut truncated = false;
@@ -9660,7 +10118,7 @@ impl App {
                                 if total_fetched < max_rows {
                                     let mut out_row = Vec::with_capacity(row.len());
                                     for i in 0..row.len() {
-                                        out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                        out_row.push(simple_query_grid_cell(row.get(i)));
                                     }
                                     first_page_rows.push(out_row);
                                     total_fetched += 1;
@@ -9716,7 +10174,7 @@ impl App {
                     } else {
                         "OK".to_string()
                     };
-                    vec![vec![status]]
+                    vec![text_grid_row([status])]
                 } else {
                     first_page_rows
                 },
@@ -9785,12 +10243,12 @@ impl App {
                 let guard = client.lock().await;
                 match guard.simple_query(&continuation_fetch_query).await {
                     Ok(messages) => {
-                        let mut page_rows: Vec<Vec<String>> = Vec::new();
+                        let mut page_rows: Vec<Vec<GridCell>> = Vec::new();
                         for msg in messages {
                             if let SimpleQueryMessage::Row(row) = msg {
                                 let mut out_row = Vec::with_capacity(row.len());
                                 for i in 0..row.len() {
-                                    out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                    out_row.push(simple_query_grid_cell(row.get(i)));
                                 }
                                 page_rows.push(out_row);
                                 total_fetched += 1;
@@ -9856,9 +10314,9 @@ impl App {
                     let elapsed = started.elapsed();
 
                     let mut current_headers: Option<Vec<String>> = None;
-                    let mut current_rows: Vec<Vec<String>> = Vec::new();
+                    let mut current_rows: Vec<Vec<GridCell>> = Vec::new();
                     let mut last_headers: Vec<String> = Vec::new();
-                    let mut last_rows: Vec<Vec<String>> = Vec::new();
+                    let mut last_rows: Vec<Vec<GridCell>> = Vec::new();
                     let mut last_cmd: Option<String> = None;
                     let mut truncated = false;
 
@@ -9877,7 +10335,7 @@ impl App {
                                 if current_rows.len() < max_rows {
                                     let mut out_row = Vec::with_capacity(row.len());
                                     for i in 0..row.len() {
-                                        out_row.push(row.get(i).unwrap_or("NULL").to_string());
+                                        out_row.push(simple_query_grid_cell(row.get(i)));
                                     }
                                     current_rows.push(out_row);
                                 } else {
@@ -9916,7 +10374,7 @@ impl App {
                         } else {
                             last_cmd.clone().unwrap_or_else(|| "OK".to_string())
                         };
-                        (vec!["status".to_string()], vec![vec![status]])
+                        (vec!["status".to_string()], vec![text_grid_row([status])])
                     } else {
                         (last_headers, last_rows)
                     };
@@ -10106,7 +10564,7 @@ impl App {
                     match coll.count_documents(filter).await {
                         Ok(count) => QueryResult {
                             headers: vec!["count".to_string()],
-                            rows: vec![vec![count.to_string()]],
+                            rows: vec![text_grid_row([count.to_string()])],
                             command_tag: Some("countDocuments".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10132,7 +10590,7 @@ impl App {
                             let inserted_id = bson_to_grid_cell(&res.inserted_id);
                             QueryResult {
                                 headers: vec!["status".to_string(), "inserted_id".to_string()],
-                                rows: vec![vec!["insertOne".to_string(), inserted_id]],
+                                rows: vec![text_grid_row(["insertOne".to_string(), inserted_id])],
                                 command_tag: Some("insertOne".to_string()),
                                 truncated: false,
                                 elapsed: started.elapsed(),
@@ -10157,10 +10615,10 @@ impl App {
                     match coll.insert_many(documents).await {
                         Ok(res) => QueryResult {
                             headers: vec!["status".to_string(), "inserted_count".to_string()],
-                            rows: vec![vec![
+                            rows: vec![text_grid_row([
                                 "insertMany".to_string(),
                                 res.inserted_ids.len().to_string(),
-                            ]],
+                            ])],
                             command_tag: Some("insertMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10189,11 +10647,11 @@ impl App {
                                 "matched".to_string(),
                                 "modified".to_string(),
                             ],
-                            rows: vec![vec![
+                            rows: vec![text_grid_row([
                                 "updateOne".to_string(),
                                 res.matched_count.to_string(),
                                 res.modified_count.to_string(),
-                            ]],
+                            ])],
                             command_tag: Some("updateOne".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10226,11 +10684,11 @@ impl App {
                                 "matched".to_string(),
                                 "modified".to_string(),
                             ],
-                            rows: vec![vec![
+                            rows: vec![text_grid_row([
                                 "updateMany".to_string(),
                                 res.matched_count.to_string(),
                                 res.modified_count.to_string(),
-                            ]],
+                            ])],
                             command_tag: Some("updateMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10255,10 +10713,10 @@ impl App {
                     match coll.delete_one(filter).await {
                         Ok(res) => QueryResult {
                             headers: vec!["status".to_string(), "deleted".to_string()],
-                            rows: vec![vec![
+                            rows: vec![text_grid_row([
                                 "deleteOne".to_string(),
                                 res.deleted_count.to_string(),
-                            ]],
+                            ])],
                             command_tag: Some("deleteOne".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10279,10 +10737,10 @@ impl App {
                     match coll.delete_many(filter).await {
                         Ok(res) => QueryResult {
                             headers: vec!["status".to_string(), "deleted".to_string()],
-                            rows: vec![vec![
+                            rows: vec![text_grid_row([
                                 "deleteMany".to_string(),
                                 res.deleted_count.to_string(),
-                            ]],
+                            ])],
                             command_tag: Some("deleteMany".to_string()),
                             truncated: false,
                             elapsed: started.elapsed(),
@@ -10555,11 +11013,23 @@ impl App {
 
                 // Set status
                 if is_paged {
-                    // More rows available on demand
-                    self.last_status =
-                        Some(format!("{} rows (scroll for more)", self.grid.rows.len()));
+                    let cap = self
+                        .paged_query
+                        .as_ref()
+                        .map(|paged| paged.max_rows)
+                        .unwrap_or_else(|| effective_max_rows(self.config.connection.max_rows));
+                    self.last_status = Some(format!(
+                        "{} rows loaded; scroll for more (cap {})",
+                        self.grid.rows.len(),
+                        cap
+                    ));
                 } else if result.truncated {
-                    self.last_status = Some("[truncated]".to_string());
+                    let cap = effective_max_rows(self.config.connection.max_rows);
+                    self.last_status = Some(format!(
+                        "Showing first {} rows (cap {}; raise connection.max_rows)",
+                        self.grid.rows.len(),
+                        cap
+                    ));
                 } else {
                     self.last_status = Some("Ready".to_string());
                 }
@@ -10617,7 +11087,7 @@ impl App {
                 // Update the grid cell
                 if let Some(grid_row) = self.grid.rows.get_mut(row) {
                     if let Some(cell) = grid_row.get_mut(col) {
-                        *cell = value;
+                        *cell = crate::ui::GridCell::Text(value);
                     }
                 }
                 self.last_status = Some("Cell updated successfully".to_string());
@@ -10658,15 +11128,28 @@ impl App {
                     self.query_ui.clear();
                     self.paged_query = None; // Clear paged query state when all rows fetched
                     if truncated {
-                        self.last_status = Some("[truncated]".to_string());
+                        let cap = effective_max_rows(self.config.connection.max_rows);
+                        self.last_status = Some(format!(
+                            "Showing first {} rows (cap {}; raise connection.max_rows)",
+                            self.grid.rows.len(),
+                            cap
+                        ));
                     } else {
                         self.last_status = Some("Ready".to_string());
                     }
                 } else {
                     // More rows available on demand
                     if new_rows_count > 0 {
-                        self.last_status =
-                            Some(format!("{} rows (scroll for more)", self.grid.rows.len()));
+                        let cap = self
+                            .paged_query
+                            .as_ref()
+                            .map(|paged| paged.max_rows)
+                            .unwrap_or_else(|| effective_max_rows(self.config.connection.max_rows));
+                        self.last_status = Some(format!(
+                            "{} rows loaded; scroll for more (cap {})",
+                            self.grid.rows.len(),
+                            cap
+                        ));
                     }
                 }
             }
@@ -10825,8 +11308,13 @@ impl App {
             "disconnected".to_string()
         };
 
+        let configured_connection_color = self
+            .active_saved_connection()
+            .and_then(|entry| entry.color.to_ratatui_color());
         let conn_style = match self.db.status {
-            DbStatus::Connected => Style::default().fg(Color::Green),
+            DbStatus::Connected => {
+                Style::default().fg(configured_connection_color.unwrap_or(Color::Green))
+            }
             DbStatus::Connecting => Style::default().fg(Color::Yellow),
             DbStatus::Error => Style::default().fg(Color::Red),
             DbStatus::Disconnected => Style::default().fg(Color::DarkGray),
@@ -10857,7 +11345,11 @@ impl App {
         // Running/loading indicator
         let paged_loading = self.paged_query.as_ref().is_some_and(|p| p.loading);
         let running_indicator = if self.db.running {
-            Some("⏳ running")
+            if self.db.kind == Some(DbKind::Mongo) {
+                Some("⏳ running")
+            } else {
+                Some("⏳ running · Esc cancel")
+            }
         } else if paged_loading {
             Some("⏳ loading")
         } else {
@@ -10894,6 +11386,14 @@ impl App {
                 StatusSegment::new(conn_segment, Priority::Critical)
                     .style(conn_style)
                     .min_width(40),
+            )
+            .segment_if(
+                self.active_connection_is_read_only(),
+                StatusSegment::new("READ ONLY", Priority::Critical).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
             )
             // Critical: Running indicator (if running) - always visible
             .segment_if(
@@ -11259,22 +11759,6 @@ fn calculate_editor_scroll(
     (scroll_row as u16, scroll_col as u16)
 }
 
-fn escape_sql_literal_for_where(s: &str) -> String {
-    if s.eq_ignore_ascii_case("null") {
-        return "NULL".to_string();
-    }
-
-    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-        return s.to_string();
-    }
-
-    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
-        return s.to_uppercase();
-    }
-
-    format!("'{}'", s.replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11384,6 +11868,27 @@ mod tests {
         assert_eq!(effective_max_rows(0), 2000);
         assert_eq!(effective_max_rows(1), 1);
         assert_eq!(effective_max_rows(10_000), 10_000);
+    }
+
+    #[test]
+    fn test_simple_query_cells_distinguish_null_from_text_null() {
+        assert_eq!(simple_query_grid_cell(None), GridCell::Null);
+        assert_eq!(
+            simple_query_grid_cell(Some("NULL")),
+            GridCell::Text("NULL".to_string())
+        );
+    }
+
+    #[test]
+    fn test_metadata_queries_use_postgres_parameters() {
+        for query in [
+            META_QUERY_DESCRIBE,
+            META_QUERY_PRIMARY_KEYS,
+            META_QUERY_COLUMN_TYPES,
+        ] {
+            assert!(query.contains("$1"));
+            assert!(!query.contains("'$1'"));
+        }
     }
 
     #[test]
@@ -12332,7 +12837,7 @@ mod tests {
         // Simulate a query finishing with results
         let result = QueryResult {
             headers: vec!["id".to_string(), "name".to_string()],
-            rows: vec![vec!["1".to_string(), "Alice".to_string()]],
+            rows: vec![text_grid_row(["1".to_string(), "Alice".to_string()])],
             command_tag: Some("SELECT 1".to_string()),
             truncated: false,
             elapsed: Duration::from_millis(10),
@@ -13143,7 +13648,7 @@ mod tests {
         app.apply_db_event(DbEvent::QueryFinished {
             result: QueryResult {
                 headers: vec!["value".to_string()],
-                rows: vec![vec!["1".to_string()]],
+                rows: vec![text_grid_row(["1".to_string()])],
                 command_tag: Some("SELECT 1".to_string()),
                 truncated: false,
                 elapsed: Duration::ZERO,
@@ -15324,23 +15829,30 @@ mod tests {
     fn test_is_pageable_query_with_where() {
         assert!(is_pageable_query("SELECT * FROM users WHERE id > 10"));
         assert!(is_pageable_query("SELECT * FROM users WHERE name = 'test'"));
+        assert!(is_pageable_query("SELECT ';' AS punctuation"));
+        assert!(is_pageable_query("SELECT $$a;b$$ AS punctuation"));
     }
 
     #[test]
-    fn test_is_pageable_query_rejects_joins() {
-        assert!(!is_pageable_query(
+    fn test_is_pageable_query_accepts_joins() {
+        assert!(is_pageable_query(
             "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
         ));
-        assert!(!is_pageable_query(
+        assert!(is_pageable_query(
             "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id"
         ));
     }
 
     #[test]
-    fn test_is_pageable_query_rejects_subqueries() {
-        assert!(!is_pageable_query(
+    fn test_is_pageable_query_accepts_subqueries_and_ctes() {
+        assert!(is_pageable_query(
             "SELECT * FROM (SELECT * FROM users) AS sub"
         ));
+        assert!(is_pageable_query(
+            "WITH recent AS (SELECT * FROM users) SELECT * FROM recent"
+        ));
+        assert!(is_pageable_query("VALUES (1), (2)"));
+        assert!(is_pageable_query("TABLE users"));
     }
 
     #[test]
@@ -15359,6 +15871,29 @@ mod tests {
             "SELECT * FROM users; SELECT * FROM orders"
         ));
         assert!(!is_pageable_query("BEGIN; SELECT * FROM users; COMMIT"));
+        assert!(contains_unsafe_row_returning_batch(
+            "BEGIN; SELECT * FROM users; COMMIT"
+        ));
+        assert!(!contains_unsafe_row_returning_batch(
+            "BEGIN; UPDATE users SET active = true WHERE id = 1; COMMIT"
+        ));
+    }
+
+    #[test]
+    fn test_dml_returning_is_wrapped_with_server_side_limit() {
+        let wrapped = wrap_dml_returning_query(
+            "UPDATE users SET active = false WHERE id = 1 RETURNING id, active;",
+            2000,
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped,
+            "WITH tsql_affected_rows AS (UPDATE users SET active = false WHERE id = 1 RETURNING id, active) SELECT * FROM tsql_affected_rows LIMIT 2001"
+        );
+        assert!(
+            wrap_dml_returning_query("UPDATE users SET active = false WHERE id = 1", 2000)
+                .is_none()
+        );
     }
 
     #[test]
@@ -15389,6 +15924,156 @@ mod tests {
         assert!(!is_row_returning_query("CREATE TABLE t (id int)"));
         assert!(!is_row_returning_query(""));
         assert!(!is_row_returning_query("   "));
+    }
+
+    #[test]
+    fn test_sql_safety_classifier_handles_writes_and_quoted_text() {
+        assert_eq!(
+            classify_sql_safety("SELECT 'DROP TABLE users'"),
+            SqlSafety::ReadOnly
+        );
+        assert_eq!(
+            classify_sql_safety("UPDATE users SET active = false WHERE id = 1"),
+            SqlSafety::Write
+        );
+        assert_eq!(
+            classify_sql_safety("UPDATE users SET note = 'where'"),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_sql_safety("DELETE FROM users -- WHERE id = 1"),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_sql_safety("WITH old AS (SELECT 1) DELETE FROM users WHERE id = 1"),
+            SqlSafety::Write
+        );
+        assert_eq!(
+            classify_sql_safety(
+                "WITH removed AS (DELETE FROM users RETURNING *) SELECT * FROM removed"
+            ),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_sql_safety(
+                "WITH changed AS (UPDATE users SET active = false WHERE id = 1 RETURNING *) SELECT * FROM changed"
+            ),
+            SqlSafety::Write
+        );
+        assert_eq!(
+            classify_sql_safety("UPDATE users SET note = $tag$WHERE id = 1$tag$"),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_sql_safety("EXPLAIN ANALYZE DELETE FROM users"),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_sql_safety("TRUNCATE users"),
+            SqlSafety::Destructive
+        );
+    }
+
+    #[test]
+    fn test_mongo_safety_classifier_detects_writes_and_unfiltered_many_ops() {
+        assert_eq!(
+            classify_mongo_safety("db.users.find({ active: true })"),
+            SqlSafety::ReadOnly
+        );
+        assert_eq!(
+            classify_mongo_safety(
+                "db.users.updateMany({ active: true }, { $set: { active: false } })"
+            ),
+            SqlSafety::Write
+        );
+        assert_eq!(
+            classify_mongo_safety("db.users.deleteMany({})"),
+            SqlSafety::Destructive
+        );
+        assert_eq!(
+            classify_mongo_safety("db.users.aggregate([{ $out: 'users_archive' }])"),
+            SqlSafety::Destructive
+        );
+    }
+
+    #[test]
+    fn test_destructive_query_requests_confirmation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.db.kind = Some(DbKind::Postgres);
+
+        app.execute_query_text("DELETE FROM users".to_string(), QueryExecutionKind::New);
+
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+            Some(ConfirmContext::ExecuteDestructiveQuery { query, refresh: false })
+                if query == "DELETE FROM users"
+        ));
+        assert!(!app.db.running);
+    }
+
+    #[test]
+    fn test_read_only_saved_connection_blocks_writes() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+        app.db.kind = Some(DbKind::Postgres);
+        let mut prod = ConnectionEntry::new("prod");
+        prod.database = "app".to_string();
+        prod.user = "postgres".to_string();
+        app.connections.add(prod).unwrap();
+        app.connections
+            .read_only_connections
+            .push("prod".to_string());
+        app.active_connection_name = Some("prod".to_string());
+
+        app.execute_query_text(
+            "INSERT INTO audit_log(message) VALUES ('test')".to_string(),
+            QueryExecutionKind::New,
+        );
+
+        assert_eq!(app.last_status.as_deref(), Some("Read-only connection"));
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Write blocked")));
+        assert!(!app.db.running);
+    }
+
+    #[test]
+    fn test_cell_update_confirmation_includes_generated_sql() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = App::new(GridModel::empty(), rt.handle().clone(), tx, rx, None);
+        app.connection_picker = None;
+        app.connection_manager = None;
+
+        app.request_cell_update_confirmation(
+            "UPDATE users SET name = 'Ada' WHERE id = '1'".to_string(),
+            0,
+            1,
+            "Ada".to_string(),
+        );
+
+        assert!(matches!(
+            app.confirm_prompt.as_ref().map(ConfirmPrompt::context),
+            Some(ConfirmContext::ExecuteCellUpdate { sql, row: 0, col: 1, .. })
+                if sql.contains("UPDATE users SET name")
+        ));
     }
 
     // ========== resolve_ssl_mode tests ==========

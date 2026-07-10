@@ -103,7 +103,7 @@ impl GridSearch {
         // Find all matches (case-insensitive)
         for (row_idx, row) in model.rows.iter().enumerate() {
             for (col_idx, cell) in row.iter().enumerate() {
-                if cell.to_lowercase().contains(&self.pattern) {
+                if cell.display_text().to_lowercase().contains(&self.pattern) {
                     self.matches.push(GridMatch {
                         row: row_idx,
                         col: col_idx,
@@ -441,12 +441,10 @@ impl GridState {
             }
 
             // o to open row detail view
-            (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                if row_count > 0 {
-                    return GridKeyResult::OpenRowDetail {
-                        row: self.cursor_row,
-                    };
-                }
+            (KeyCode::Char('o'), KeyModifiers::NONE) if row_count > 0 => {
+                return GridKeyResult::OpenRowDetail {
+                    row: self.cursor_row,
+                };
             }
 
             _ => {}
@@ -812,9 +810,65 @@ impl GridState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GridCell {
+    Null,
+    Text(String),
+}
+
+impl GridCell {
+    pub fn raw_text(&self) -> &str {
+        match self {
+            GridCell::Null => "NULL",
+            GridCell::Text(value) => value,
+        }
+    }
+
+    pub fn display_text(&self) -> &str {
+        match self {
+            GridCell::Null => "∅",
+            GridCell::Text(value) => value,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, GridCell::Null)
+    }
+}
+
+impl Default for GridCell {
+    fn default() -> Self {
+        GridCell::Text(String::new())
+    }
+}
+
+impl PartialEq<&str> for GridCell {
+    fn eq(&self, other: &&str) -> bool {
+        self.raw_text() == *other
+    }
+}
+
+impl From<String> for GridCell {
+    fn from(value: String) -> Self {
+        GridCell::Text(value)
+    }
+}
+
+impl From<&str> for GridCell {
+    fn from(value: &str) -> Self {
+        GridCell::Text(value.to_string())
+    }
+}
+
+impl AsRef<str> for GridCell {
+    fn as_ref(&self) -> &str {
+        self.raw_text()
+    }
+}
+
 pub struct GridModel {
     pub headers: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<GridCell>>,
     pub col_widths: Vec<u16>,
     /// The source table name, if known (extracted from simple SELECT queries).
     pub source_table: Option<String>,
@@ -825,7 +879,18 @@ pub struct GridModel {
 }
 
 impl GridModel {
-    pub fn new(headers: Vec<String>, rows: Vec<Vec<String>>) -> Self {
+    pub fn new<T>(headers: Vec<String>, rows: Vec<Vec<T>>) -> Self
+    where
+        T: Into<GridCell>,
+    {
+        let rows = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(Into::into).collect())
+            .collect::<Vec<Vec<GridCell>>>();
+        Self::new_cells(headers, rows)
+    }
+
+    pub fn new_cells(headers: Vec<String>, rows: Vec<Vec<GridCell>>) -> Self {
         let col_widths = compute_column_widths(&headers, &rows);
         let col_count = headers.len();
         Self {
@@ -871,7 +936,14 @@ impl GridModel {
     ///
     /// Note: If new rows have more columns than the existing model, extra columns
     /// are ignored. If new rows have fewer columns, missing columns are not processed.
-    pub fn append_rows(&mut self, new_rows: Vec<Vec<String>>) {
+    pub fn append_rows<T>(&mut self, new_rows: Vec<Vec<T>>)
+    where
+        T: Into<GridCell>,
+    {
+        let new_rows = new_rows
+            .into_iter()
+            .map(|row| row.into_iter().map(Into::into).collect())
+            .collect::<Vec<Vec<GridCell>>>();
         // Update column widths for any cells that are wider than current widths
         for row in &new_rows {
             for (i, cell) in row.iter().enumerate() {
@@ -879,10 +951,10 @@ impl GridModel {
                     break;
                 }
                 // For UUIDs, use the truncated display width
-                let effective_width = if is_uuid(cell) {
+                let effective_width = if is_uuid(cell.raw_text()) {
                     UUID_DISPLAY_WIDTH
                 } else {
-                    UnicodeWidthStr::width(cell.as_str()) as u16
+                    UnicodeWidthStr::width(cell.display_text()) as u16
                 };
                 let w = effective_width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
                 if w > self.col_widths[i] {
@@ -921,12 +993,23 @@ impl GridModel {
         self.rows
             .get(row)
             .and_then(|r| r.get(col))
-            .map(|s| s.as_str())
+            .map(GridCell::raw_text)
     }
 
     /// Format a single row as tab-separated values.
     pub fn row_as_tsv(&self, row_idx: usize) -> Option<String> {
-        self.rows.get(row_idx).map(|row| row.join("\t"))
+        self.rows.get(row_idx).map(|row| {
+            row.iter()
+                .map(|cell| {
+                    if cell.is_null() {
+                        "\\N"
+                    } else {
+                        cell.raw_text()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
     }
 
     /// Format multiple rows as tab-separated values (with headers).
@@ -939,7 +1022,18 @@ impl GridModel {
 
         for &idx in row_indices {
             if let Some(row) = self.rows.get(idx) {
-                lines.push(row.join("\t"));
+                lines.push(
+                    row.iter()
+                        .map(|cell| {
+                            if cell.is_null() {
+                                "\\N"
+                            } else {
+                                cell.raw_text()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\t"),
+                );
             }
         }
 
@@ -950,7 +1044,13 @@ impl GridModel {
     pub fn row_as_csv(&self, row_idx: usize) -> Option<String> {
         self.rows.get(row_idx).map(|row| {
             row.iter()
-                .map(|cell| escape_csv(cell))
+                .map(|cell| {
+                    if cell.is_null() {
+                        String::new()
+                    } else {
+                        escape_csv(cell.raw_text())
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         })
@@ -974,7 +1074,13 @@ impl GridModel {
             if let Some(row) = self.rows.get(idx) {
                 lines.push(
                     row.iter()
-                        .map(|cell| escape_csv(cell))
+                        .map(|cell| {
+                            if cell.is_null() {
+                                String::new()
+                            } else {
+                                escape_csv(cell.raw_text())
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(","),
                 );
@@ -991,7 +1097,17 @@ impl GridModel {
                 .headers
                 .iter()
                 .zip(row.iter())
-                .map(|(h, v)| format!("  \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                .map(|(h, v)| {
+                    if v.is_null() {
+                        format!("  \"{}\": null", escape_json(h))
+                    } else {
+                        format!(
+                            "  \"{}\": \"{}\"",
+                            escape_json(h),
+                            escape_json(v.raw_text())
+                        )
+                    }
+                })
                 .collect();
             format!("{{\n{}\n}}", pairs.join(",\n"))
         })
@@ -1007,7 +1123,17 @@ impl GridModel {
                         .headers
                         .iter()
                         .zip(row.iter())
-                        .map(|(h, v)| format!("    \"{}\": \"{}\"", escape_json(h), escape_json(v)))
+                        .map(|(h, v)| {
+                            if v.is_null() {
+                                format!("    \"{}\": null", escape_json(h))
+                            } else {
+                                format!(
+                                    "    \"{}\": \"{}\"",
+                                    escape_json(h),
+                                    escape_json(v.raw_text())
+                                )
+                            }
+                        })
                         .collect();
                     format!("  {{\n{}\n  }}", pairs.join(",\n"))
                 })
@@ -1041,7 +1167,7 @@ impl GridModel {
                 format!(
                     "| {} |",
                     row.iter()
-                        .map(|v| escape_cell(v))
+                        .map(|v| escape_cell(v.display_text()))
                         .collect::<Vec<_>>()
                         .join(" | ")
                 )
@@ -1100,10 +1226,10 @@ impl GridModel {
             .iter()
             .filter_map(|row| row.get(col))
             .map(|cell| {
-                if is_uuid(cell) {
+                if is_uuid(cell.raw_text()) {
                     9 // 8 hex chars + "…" (unicode ellipsis)
                 } else {
-                    display_width(cell) as u16
+                    display_width(cell.display_text()) as u16
                 }
             })
             .max()
@@ -1121,7 +1247,7 @@ impl GridModel {
             .rows
             .iter()
             .filter_map(|row| row.get(col))
-            .map(|cell| display_width(cell) as u16)
+            .map(|cell| display_width(cell.display_text()) as u16)
             .max()
             .unwrap_or(0);
 
@@ -1159,7 +1285,7 @@ impl GridModel {
     fn generate_single_update(
         &self,
         table: &str,
-        row: &[String],
+        row: &[GridCell],
         key_columns: Option<&[&str]>,
     ) -> String {
         // Determine which columns are keys and which are values to set
@@ -1188,9 +1314,8 @@ impl GridModel {
             .enumerate()
             .filter(|(i, _)| !key_indices.contains(i))
             .filter_map(|(i, header)| {
-                row.get(i).map(|value| {
-                    format!("{} = {}", quote_identifier(header), escape_sql_value(value))
-                })
+                row.get(i)
+                    .map(|value| format!("{} = {}", quote_identifier(header), grid_cell_sql(value)))
             })
             .collect();
 
@@ -1203,7 +1328,7 @@ impl GridModel {
                 Some(format!(
                     "{} = {}",
                     quote_identifier(header),
-                    escape_sql_value(value)
+                    grid_cell_sql(value)
                 ))
             })
             .collect();
@@ -1260,7 +1385,7 @@ impl GridModel {
     fn generate_single_delete(
         &self,
         table: &str,
-        row: &[String],
+        row: &[GridCell],
         key_columns: Option<&[&str]>,
     ) -> String {
         // Determine which columns to use in WHERE clause
@@ -1287,7 +1412,7 @@ impl GridModel {
                 Some(format!(
                     "{} = {}",
                     quote_identifier(header),
-                    escape_sql_value(value)
+                    grid_cell_sql(value)
                 ))
             })
             .collect();
@@ -1318,7 +1443,7 @@ impl GridModel {
             .iter()
             .filter_map(|&idx| self.rows.get(idx))
             .map(|row| {
-                let vals: Vec<String> = row.iter().map(|v| escape_sql_value(v)).collect();
+                let vals: Vec<String> = row.iter().map(grid_cell_sql).collect();
                 format!("({})", vals.join(", "))
             })
             .collect();
@@ -1338,11 +1463,97 @@ impl GridModel {
 
 /// Quote a SQL identifier (column/table name).
 pub fn quote_identifier(s: &str) -> String {
-    // If it contains special chars or is a reserved word, quote it
-    if s.chars()
+    let is_simple = s
+        .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && !s.chars().next().is_none_or(|c| c.is_ascii_digit())
-    {
+        && !s.chars().next().is_none_or(|c| c.is_ascii_digit());
+    let is_reserved = matches!(
+        s.to_ascii_uppercase().as_str(),
+        "ALL"
+            | "ANALYSE"
+            | "ANALYZE"
+            | "AND"
+            | "ANY"
+            | "ARRAY"
+            | "AS"
+            | "ASC"
+            | "ASYMMETRIC"
+            | "AUTHORIZATION"
+            | "BINARY"
+            | "BOTH"
+            | "CASE"
+            | "CAST"
+            | "CHECK"
+            | "COLLATE"
+            | "COLUMN"
+            | "CONSTRAINT"
+            | "CREATE"
+            | "CURRENT_CATALOG"
+            | "CURRENT_DATE"
+            | "CURRENT_ROLE"
+            | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_USER"
+            | "DEFAULT"
+            | "DEFERRABLE"
+            | "DESC"
+            | "DISTINCT"
+            | "DO"
+            | "ELSE"
+            | "END"
+            | "EXCEPT"
+            | "FALSE"
+            | "FETCH"
+            | "FOR"
+            | "FOREIGN"
+            | "FROM"
+            | "GRANT"
+            | "GROUP"
+            | "HAVING"
+            | "IN"
+            | "INITIALLY"
+            | "INTERSECT"
+            | "INTO"
+            | "LATERAL"
+            | "LEADING"
+            | "LIMIT"
+            | "LOCALTIME"
+            | "LOCALTIMESTAMP"
+            | "NEW"
+            | "NOT"
+            | "NULL"
+            | "OFF"
+            | "OFFSET"
+            | "OLD"
+            | "ON"
+            | "ONLY"
+            | "OR"
+            | "ORDER"
+            | "PLACING"
+            | "PRIMARY"
+            | "REFERENCES"
+            | "RETURNING"
+            | "SELECT"
+            | "SESSION_USER"
+            | "SOME"
+            | "SYMMETRIC"
+            | "TABLE"
+            | "THEN"
+            | "TO"
+            | "TRAILING"
+            | "TRUE"
+            | "UNION"
+            | "UNIQUE"
+            | "USER"
+            | "USING"
+            | "VARIADIC"
+            | "WHEN"
+            | "WHERE"
+            | "WINDOW"
+            | "WITH"
+    );
+
+    if is_simple && !is_reserved {
         s.to_string()
     } else {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -1368,6 +1579,36 @@ pub fn escape_sql_value(s: &str) -> String {
 
     // Otherwise, quote as string
     format!("'{}'", s.replace('\'', "''"))
+}
+
+fn grid_cell_sql(cell: &GridCell) -> String {
+    match cell {
+        GridCell::Null => "NULL".to_string(),
+        GridCell::Text(value) => format!("'{}'", value.replace('\'', "''")),
+    }
+}
+
+/// Escape an edited value using the database column type instead of guessing
+/// from the value's spelling.
+pub fn escape_sql_value_for_type(s: &str, type_hint: Option<&str>) -> String {
+    let type_hint = type_hint.unwrap_or_default().trim();
+    let is_text = matches!(
+        type_hint,
+        "text"
+            | "character"
+            | "character varying"
+            | "varchar"
+            | "char"
+            | "bpchar"
+            | "name"
+            | "citext"
+    );
+
+    if s.eq_ignore_ascii_case("null") && !is_text {
+        "NULL".to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
 }
 
 /// Escape a string for CSV output.
@@ -1723,7 +1964,7 @@ fn render_row_cells_with_search(
     mut x: u16,
     y: u16,
     available_w: u16,
-    cells: &[String],
+    cells: &[GridCell],
     col_widths: &[u16],
     col_offset: usize,
     base_style: Style,
@@ -1768,13 +2009,17 @@ fn render_row_cells_with_search(
             current_match_style
         } else if search.is_match(row_idx, col) {
             match_style
+        } else if cells[col].is_null() {
+            base_style
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
         } else {
             base_style
         };
 
         // Allow a partially visible last column.
         let draw_w = w.min(remaining);
-        let content = format_cell_for_display(&cells[col], draw_w, uuid_expanded);
+        let content = format_cell_for_display(cells[col].display_text(), draw_w, uuid_expanded);
         buf.set_string(x, y, content, cell_style);
         x += draw_w;
 
@@ -1792,7 +2037,7 @@ fn render_row_cells_with_search(
     }
 }
 
-fn compute_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<u16> {
+fn compute_column_widths(headers: &[String], rows: &[Vec<GridCell>]) -> Vec<u16> {
     let mut widths: Vec<u16> = headers
         .iter()
         .map(|h| clamp_u16(display_width(h) as u16, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH))
@@ -1804,10 +2049,10 @@ fn compute_column_widths(headers: &[String], rows: &[Vec<String>]) -> Vec<u16> {
                 break;
             }
             // For UUIDs, use the truncated display width since UUIDs are displayed truncated
-            let effective_width = if is_uuid(cell) {
+            let effective_width = if is_uuid(cell.raw_text()) {
                 UUID_DISPLAY_WIDTH
             } else {
-                display_width(cell) as u16
+                display_width(cell.display_text()) as u16
             };
             let w = clamp_u16(effective_width, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
             widths[i] = widths[i].max(w);
@@ -2411,8 +2656,8 @@ mod tests {
             "Should have UPDATE clause"
         );
         assert!(sql.contains("name = 'Alice'"), "Should set name column");
-        assert!(sql.contains("age = 30"), "Should set age column (numeric)");
-        assert!(sql.contains("WHERE id = 1"), "Should have WHERE with id");
+        assert!(sql.contains("age = '30'"), "Should preserve the age value");
+        assert!(sql.contains("WHERE id = '1'"), "Should have WHERE with id");
     }
 
     #[test]
@@ -2429,8 +2674,8 @@ mod tests {
         let lines: Vec<&str> = sql.lines().collect();
 
         assert_eq!(lines.len(), 2, "Should generate 2 UPDATE statements");
-        assert!(lines[0].contains("WHERE id = 1"));
-        assert!(lines[1].contains("WHERE id = 2"));
+        assert!(lines[0].contains("WHERE id = '1'"));
+        assert!(lines[1].contains("WHERE id = '2'"));
     }
 
     #[test]
@@ -2447,7 +2692,7 @@ mod tests {
             sql.contains("DELETE FROM users WHERE"),
             "Should have DELETE clause"
         );
-        assert!(sql.contains("id = 1"), "Should have id in WHERE");
+        assert!(sql.contains("id = '1'"), "Should have id in WHERE");
         assert!(sql.contains("name = 'Alice'"), "Should have name in WHERE");
     }
 
@@ -2460,7 +2705,7 @@ mod tests {
 
         let sql = model.generate_delete_sql("users", &[0], Some(&["id"]));
 
-        assert!(sql.contains("DELETE FROM users WHERE id = 1;"));
+        assert!(sql.contains("DELETE FROM users WHERE id = '1';"));
         assert!(
             !sql.contains("name"),
             "Should not include name in WHERE when id is the key"
@@ -2480,8 +2725,8 @@ mod tests {
         let sql = model.generate_insert_sql("users", &[0, 1]);
 
         assert!(sql.contains("INSERT INTO users (id, name) VALUES"));
-        assert!(sql.contains("(1, 'Alice')"));
-        assert!(sql.contains("(2, 'Bob')"));
+        assert!(sql.contains("('1', 'Alice')"));
+        assert!(sql.contains("('2', 'Bob')"));
     }
 
     #[test]
@@ -2509,7 +2754,10 @@ mod tests {
 
         let sql = model.generate_insert_sql("items", &[0]);
 
-        assert!(sql.contains("NULL"), "Empty string should become NULL");
+        assert!(
+            sql.contains("''"),
+            "Text empty string should stay an empty string"
+        );
     }
 
     #[test]
@@ -2524,6 +2772,38 @@ mod tests {
         assert!(
             sql.contains("\"user-id\"") || sql.contains("\"First Name\""),
             "Should quote identifiers with special characters"
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier_quotes_reserved_words() {
+        assert_eq!(quote_identifier("order"), "\"order\"");
+        assert_eq!(quote_identifier("select"), "\"select\"");
+        assert_eq!(quote_identifier("account_id"), "account_id");
+    }
+
+    #[test]
+    fn test_typed_sql_values_preserve_text_spelling() {
+        assert_eq!(escape_sql_value_for_type("123", Some("text")), "'123'");
+        assert_eq!(escape_sql_value_for_type("null", Some("text")), "'null'");
+        assert_eq!(escape_sql_value_for_type("null", Some("integer")), "NULL");
+    }
+
+    #[test]
+    fn test_null_cells_are_lossless_in_exports() {
+        let model = GridModel::new_cells(
+            vec!["actual_null".to_string(), "text_null".to_string()],
+            vec![vec![GridCell::Null, GridCell::Text("NULL".to_string())]],
+        );
+
+        assert_eq!(model.row_as_tsv(0).as_deref(), Some("\\N\tNULL"));
+        assert_eq!(
+            model.row_as_json(0).as_deref(),
+            Some("{\n  \"actual_null\": null,\n  \"text_null\": \"NULL\"\n}")
+        );
+        assert_eq!(
+            model.generate_insert_sql("items", &[0]),
+            "INSERT INTO items (actual_null, text_null) VALUES\n(NULL, 'NULL');"
         );
     }
 
@@ -2922,7 +3202,7 @@ mod tests {
         let original_len = model.rows.len();
         let original_widths = model.col_widths.clone();
 
-        model.append_rows(vec![]);
+        model.append_rows(Vec::<Vec<String>>::new());
 
         assert_eq!(model.rows.len(), original_len);
         assert_eq!(model.col_widths, original_widths);

@@ -802,11 +802,10 @@ impl HelpPopup {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let scroll_info = if self.total_lines > self.visible_height {
-            let percent = if self.total_lines == 0 {
-                100
-            } else {
-                ((self.scroll_offset + self.visible_height) * 100 / self.total_lines).min(100)
-            };
+            let percent = ((self.scroll_offset + self.visible_height) * 100)
+                .checked_div(self.total_lines)
+                .unwrap_or(100)
+                .min(100);
             format!("{}%", percent)
         } else {
             "All".to_string()

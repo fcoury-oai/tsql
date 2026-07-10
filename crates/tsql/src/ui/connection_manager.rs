@@ -536,9 +536,7 @@ impl ConnectionManagerModal {
                     .cmp(&a.use_count)
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
-            SortMode::Alpha => {
-                sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
+            SortMode::Alpha => sorted.sort_by_key(|entry| entry.name.to_lowercase()),
             SortMode::Folder => sorted.sort_by(|a, b| {
                 let fa = a.folder.as_deref().unwrap_or("~");
                 let fb = b.folder.as_deref().unwrap_or("~");
